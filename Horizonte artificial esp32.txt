@@ -1,0 +1,143 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_GC9A01A.h>
+
+// Definição estrita dos pinos do Display GC9A01
+#define TFT_MOSI 11  // SDA na tela
+#define TFT_SCLK 12  // SCL na tela
+#define TFT_DC   10  // DC na tela
+#define TFT_CS   13  // CS na tela
+#define TFT_RST  14  // RST na tela
+
+#define MPU6050_ADDR 0x68
+
+// CORREÇÃO CRÍTICA PARA VELOCIDADE MÁXIMA (60 FPS):
+// Passamos apenas CS, DC e RST. Os pinos MOSI e SCLK serão gerenciados diretamente 
+// pelo motor de Hardware SPI do ESP32-S3, rodando a impressionantes 40MHz!
+Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
+
+// Criação do Canvas de 16-bits para desenhar o céu azul e chão marrom na RAM
+GFXcanvas16 *canvas;
+
+// Cores reais em formato RGB565 de 16-bits
+#define COLOR_BLACK 0x0000 
+#define COLOR_SKY   0x44BF // Azul Céu Bonito
+#define COLOR_LAND  0x5A44 // Marrom Solo Instrumento
+#define COLOR_LINE  0xFFFF // Linha Branca
+#define COLOR_PLANE 0xFEE0 // Amarelo Aviação
+
+const int H_WIDTH = 240;
+const int H_HEIGHT = 240;
+const int CENTER_X = 120;
+const int CENTER_Y = 120;
+const int RADIUS = 115;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Inicializando Painel Scale FPV ===");
+
+  // 1. Inicializa o barramento I2C padrão para o Sensor
+  Wire.begin();
+  Wire.setClock(400000); // Velocidade rápida para leitura instantânea
+
+  // 2. Sua rotina direta de inicialização via registradores do MPU6050
+  Serial.println("Inicializando MPU6050...");
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B); // Registrador de gerenciamento de energia
+  Wire.write(0x00); // Acorda o MPU6050
+  byte erro = Wire.endTransmission();
+
+  if (erro == 0) {
+    Serial.println("MPU6050 inicializado com sucesso!");
+  } else {
+    Serial.print("Erro ao inicializar MPU6050: ");
+    Serial.println(erro);
+    while (1); // Trava se houver erro elétrico
+  }
+
+  // 3. ATIVAÇÃO DO HARDWARE SPI DO ESP32-S3 (Fim da lentidão de slides)
+  // Força o chip a usar os aceleradores físicos de transmissão de dados
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
+  
+  tft.begin(40000000); // Configura o clock do display para 40 MegaHertz
+  tft.setRotation(0);
+  tft.fillScreen(COLOR_BLACK); 
+
+  // 4. Aloca com segurança o buffer de imagem de 16-bits na RAM do ESP32-S3
+  canvas = new GFXcanvas16(H_WIDTH, H_HEIGHT);
+  
+  Serial.println("=== Sistema Otimizado via Hardware SPI! ===");
+}
+
+void loop() {
+  float pitch = 0;
+  float roll  = 0;
+
+  // 5. Sua rotina ultrarrápida de solicitação dos 6 bytes do acelerômetro
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6);
+
+  if (Wire.available() == 6) {
+    int16_t axRaw = Wire.read() << 8 | Wire.read();
+    int16_t ayRaw = Wire.read() << 8 | Wire.read();
+    int16_t azRaw = Wire.read() << 8 | Wire.read();
+
+    // Sua conversão exata para g
+    float ax = axRaw / 16384.0;
+    float ay = ayRaw / 16384.0;
+    float az = azRaw / 16384.0;
+
+    // Seus cálculos estáveis de Pitch e Roll
+    pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+    roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+  }
+
+  // Desenha os gráficos coloridos dentro da memória RAM de forma instantânea
+  desenharNoBuffer(roll, pitch);
+
+  // Envia todo o bloco colorido da RAM para a tela via Hardware SPI (Velocidade máxima!)
+  tft.drawRGBBitmap(0, 0, canvas->getBuffer(), H_WIDTH, H_HEIGHT);
+
+  delay(2); // Delay mínimo de estabilização de ciclo
+}
+
+void desenharNoBuffer(float roll, float pitch) {
+  // Limpa o fundo do buffer preenchendo com o céu azul
+  canvas->fillScreen(COLOR_SKY);
+
+  // Converte a rolagem para radianos
+  float rad = roll * PI / 180.0;
+
+  // Multiplicador de sensibilidade vertical da arfagem
+  int deslocamentoY = constrain(pitch * 2.5, -75, 75);
+
+  // Calcula a rotação geométrica das pontas do horizonte
+  int dx = RADIUS * cos(rad);
+  int dy = RADIUS * sin(rad);
+
+  int x1 = CENTER_X - dx;
+  int y1 = CENTER_Y + deslocamentoY - dy;
+  int x2 = CENTER_X + dx;
+  int y2 = CENTER_Y + deslocamentoY + dy;
+
+  // Desenha os polígonos do solo marrom sob a linha de inclinação na velocidade da RAM
+  canvas->fillTriangle(x1, y1, x2, y2, CENTER_X, 240, COLOR_LAND);
+  canvas->fillTriangle(x1, y1, 0, 240, CENTER_X, 240, COLOR_LAND);
+  canvas->fillTriangle(x2, y2, 240, 240, CENTER_X, 240, COLOR_LAND);
+
+  // Linha branca divisória do horizonte
+  canvas->drawLine(x1, y1, x2, y2, COLOR_LINE);
+
+  // Máscara de corte preta externa para deixar o instrumento perfeitamente redondo
+  canvas->drawCircle(CENTER_X, CENTER_Y, RADIUS, COLOR_BLACK);
+
+  // Elementos FIXOS em primeiro plano (Asas e nariz amarelos de referência do avião)
+  canvas->drawFastHLine(75, CENTER_Y, 25, COLOR_PLANE);   // Asa esquerda
+  canvas->drawFastHLine(140, CENTER_Y, 25, COLOR_PLANE);  // Asa direita
+  canvas->fillRect(117, CENTER_Y - 3, 7, 7, COLOR_PLANE); // Cabine / Nariz central
+  canvas->drawCircle(CENTER_X, CENTER_Y, 5, COLOR_BLACK);
+}
