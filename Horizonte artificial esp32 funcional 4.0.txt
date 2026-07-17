@@ -1,0 +1,197 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_GC9A01A.h>
+
+// Definição dos pinos do seu Display GC9A01
+#define TFT_MOSI 11  // SDA na tela
+#define TFT_SCLK 12  // SCL na tela
+#define TFT_DC   10  // DC na tela
+#define TFT_CS   13  // CS na tela
+#define TFT_RST  14  // RST na tela
+
+#define MPU6050_ADDR 0x68
+
+// Inicialização por HARDWARE SPI (40MHz nativo)
+Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
+
+// Tela Virtual de 16-bits na RAM para renderizar tudo liso
+GFXcanvas16 *canvas;
+
+// Cores baseadas nas imagens (Formato RGB565)
+#define COLOR_BLACK 0x0000 
+#define COLOR_SKY   0x057D // Azul Céu bem vivo
+#define COLOR_LAND  0xB486 // Marrom Solo/Ocre
+#define COLOR_LINE  0xFFFF // Branco Puro para linhas e números
+#define COLOR_PLANE 0xF800 // Vermelho para a aeronave central
+
+const int H_WIDTH = 240;
+const int H_HEIGHT = 240;
+const int CENTER_X = 120;
+const int CENTER_Y = 120;
+const int RADIUS = 116;
+
+// CALIBRAÇÃO DO FILTRO DIGITAL DE SOFTWARE
+const float ALPHA = 0.40; 
+float pitchFiltrado = 0;
+float rollFiltrado = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Calibrando Escala Completa ate 90 Graus ===");
+
+  // 1. Inicializa o I2C do MPU6050 antes de ligar a tela
+  Wire.begin();
+  Wire.setClock(400000); 
+
+  // Sua rotina direta de sucesso para acordar o sensor
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00); 
+  byte erro = Wire.endTransmission();
+
+  if (erro != 0) {
+    Serial.print("Erro ao inicializar MPU6050: ");
+    Serial.println(erro);
+    while (1); 
+  }
+
+  // Filtro de Hardware interno do MPU6050 a ~10Hz para eliminar ruídos finos
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A); 
+  Wire.write(0x05); 
+  Wire.endTransmission();
+
+  // 2. ATIVAÇÃO DO MOTOR DE HARDWARE SPI DO ESP32-S3 (40MHz)
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
+  tft.begin(40000000); 
+  tft.setRotation(0);
+  tft.fillScreen(COLOR_BLACK); 
+
+  // 3. Aloca o buffer gráfico de alta performance na RAM interna
+  canvas = new GFXcanvas16(H_WIDTH, H_HEIGHT);
+  canvas->setTextSize(1); // Fonte nítida para a escala de aviação
+}
+
+void loop() {
+  // Sua rotina ultrarrápida de solicitação dos registradores do acelerômetro
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6);
+
+  if (Wire.available() == 6) {
+    int16_t axRaw = Wire.read() << 8 | Wire.read();
+    int16_t ayRaw = Wire.read() << 8 | Wire.read();
+    int16_t azRaw = Wire.read() << 8 | Wire.read();
+
+    float ax = axRaw / 16384.0;
+    float ay = ayRaw / 16384.0;
+    float az = azRaw / 16384.0;
+
+    // Fórmula linear precisa para 90 graus estáveis
+    float pitchInstantaneo = atan2(ax, az) * 180.0 / PI;
+    float rollInstantaneo  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+    // Filtro Digital Combinado
+    pitchFiltrado = (ALPHA * pitchInstantaneo) + ((1.0 - ALPHA) * pitchFiltrado);
+    rollFiltrado  = (ALPHA * rollInstantaneo) + ((1.0 - ALPHA) * rollFiltrado);
+
+    // Desenha o painel com a cobertura de solo corrigida e escala completa
+    desenharPainel90Graus(rollFiltrado, pitchFiltrado);
+
+    // Transmite instantaneamente todo o bloco de pixels colorido via Hardware SPI
+    tft.drawRGBBitmap(0, 0, canvas->getBuffer(), H_WIDTH, H_HEIGHT);
+  }
+
+  delay(1); 
+}
+
+void desenharPainel90Graus(float roll, float pitch) {
+  // Inicializa o fundo da tela virtual inteira com o céu azul
+  canvas->fillScreen(COLOR_SKY);
+
+  float rad = roll * PI / 180.0;
+  float cosRad = cos(rad);
+  float sinRad = sin(rad);
+
+  // RECALIBRAÇÃO DO GANHO VERTICAL (INVERTIDO PARA SENTIDO CORRETO DA AVIAÇÃO):
+  // Adicionado o sinal de menos (-) antes de pitch para corrigir a inversão física
+  int deslocamentoY = constrain(-pitch * 1.10, -105, 105);
+
+  int raioExpandido = 200;
+  int dx = raioExpandido * cosRad;
+  int dy = raioExpandido * sinRad;
+
+  int x1 = CENTER_X - dx;
+  int y1 = CENTER_Y + deslocamentoY - dy;
+  int x2 = CENTER_X + dx;
+  int y2 = CENTER_Y + deslocamentoY + dy;
+
+  // 1. DESENHA O CHÃO MARROM ROTACIONADO
+  canvas->fillTriangle(x1, y1, x2, y2, CENTER_X, 360, COLOR_LAND);
+  canvas->fillTriangle(x1, y1, -120, 360, CENTER_X, 360, COLOR_LAND);
+  canvas->fillTriangle(x2, y2, 360, 360, CENTER_X, 360, COLOR_LAND);
+
+  // Linha branca divisória do horizonte
+  canvas->drawLine(x1, y1, x2, y2, COLOR_LINE);
+
+  // 2. ESCALA DE PITCH ATUALIZADA (Incluindo os 90° e -90° reais de aviação)
+  int grausPitch[] = {90, 80, 70, 60, 50, 40, 30, 20, 10, -10, -20, -30, -40, -50, -60, -70, -80, -90};
+  
+  for (int i = 0; i < 18; i++) {
+    // Proporção de pixels baseada no novo ganho de 1.10
+    int deltaY = deslocamentoY - (grausPitch[i] * 1.10);
+    int gY_Teorico = CENTER_Y + deltaY;
+    
+    if (gY_Teorico > 42 && gY_Teorico < 198) {
+      // Ajuste geométrico: traços de 90° são mais compactos como nos caças reais
+      int tamLinha = 32 - (abs(grausPitch[i]) * 0.22); 
+      if (tamLinha < 10) tamLinha = 10; 
+      
+      int p_x1 = CENTER_X - tamLinha * cosRad - deltaY * sinRad;
+      int p_y1 = CENTER_Y - tamLinha * sinRad + deltaY * cosRad;
+      int p_x2 = CENTER_X + tamLinha * cosRad - deltaY * sinRad;
+      int p_y2 = CENTER_Y + tamLinha * sinRad + deltaY * cosRad;
+
+      canvas->drawLine(p_x1, p_y1, p_x2, p_y2, COLOR_LINE);
+      
+      // Renderiza as numerações (10, 20... ate 90) ao lado de cada linha móvel
+      if (abs(grausPitch[i]) % 10 == 0) {
+        canvas->setTextColor(COLOR_LINE);
+        int txt_x = CENTER_X + (tamLinha + 6) * cosRad - deltaY * sinRad;
+        int txt_y = CENTER_Y + (tamLinha + 6) * sinRad + deltaY * cosRad - 3;
+        
+        canvas->setCursor(txt_x, txt_y);
+        canvas->print(abs(grausPitch[i]));
+      }
+    }
+  }
+
+  // 3. FAIXAS PRETAS ESTÁTICAS EM CIMA E EM BAIXO
+  canvas->fillRect(0, 0, 240, 42, COLOR_BLACK);
+  canvas->fillRect(0, 198, 240, 42, COLOR_BLACK);
+
+  // 4. ESCALA DE TRAÇOS DE ROLL NAS BORDAS PRETAS
+  canvas->drawFastHLine(30, 42, 180, COLOR_LINE);  
+  canvas->drawFastHLine(30, 198, 180, COLOR_LINE); 
+  
+  for (int x = 45; x <= 195; x += 15) {
+    canvas->drawFastVLine(x, 35, 7, COLOR_LINE);  
+    canvas->drawFastVLine(x, 198, 7, COLOR_LINE); 
+  }
+
+  // 5. RETÍCULA VERMELHA ENGROSSADA DA AERONAVE FIXA
+  canvas->drawFastHLine(65, CENTER_Y - 1, 35, COLOR_PLANE);
+  canvas->drawFastHLine(65, CENTER_Y,     35, COLOR_PLANE);   
+  canvas->drawFastHLine(65, CENTER_Y + 1, 35, COLOR_PLANE);
+  
+  canvas->drawFastHLine(140, CENTER_Y - 1, 35, COLOR_PLANE);   
+  canvas->drawFastHLine(140, CENTER_Y,     35, COLOR_PLANE);  
+  canvas->drawFastHLine(140, CENTER_Y + 1, 35, COLOR_PLANE);  
+  
+  canvas->drawCircle(CENTER_X, CENTER_Y, 9, COLOR_PLANE);
+  canvas->drawCircle(CENTER_X, CENTER_Y, 8, COLOR_PLANE); 
+  canvas->drawCircle(CENTER_X, CENTER_Y, 7, COLOR_PLANE);
+}
